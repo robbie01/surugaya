@@ -11,6 +11,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unsafe"
 
 	"github.com/gocolly/colly/v2"
 	_ "github.com/mattn/go-sqlite3"
@@ -20,9 +21,11 @@ type product struct {
 	id        string
 	name      string
 	condition string
-	priceLo   uint64
-	priceHi   uint64
+	priceLo   uint
+	priceHi   uint
 }
+
+const intBits int = int(unsafe.Sizeof(1) * 8)
 
 func Scrape(pageTemplates []string, dbName string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -41,20 +44,14 @@ func Scrape(pageTemplates []string, dbName string) {
 		return
 	}
 
-	// Both of these URLs report 1822 entries, yet for some reason
-	// they yield overlapping but distinct sets, and their union is still
-	// only 1760 entries.
-
 	c.OnHTML("a.page-link[href]", func(e *colly.HTMLElement) {
 		// Predictively synthesize remaining links (major optimization)
 		// Deduplication is not a concern here; colly handles this for us
 
 		url := e.Attr("href")
-		page, _ := strconv.ParseUint(pageRe.FindStringSubmatch(url)[1], 10, 64)
-		for p := uint64(1); p <= page; p++ {
-			for _, t := range pageTemplates {
-				e.Request.Visit(fmt.Sprintf("%s%d", t, p))
-			}
+		page, _ := strconv.ParseUint(pageRe.FindStringSubmatch(url)[1], 10, intBits)
+		for p := uint(1); p <= uint(page); p++ {
+			e.Request.Visit(fmt.Sprintf("%s%d", e.Request.Ctx.Get("template"), p))
 		}
 	})
 
@@ -80,14 +77,14 @@ func Scrape(pageTemplates []string, dbName string) {
 			}
 		}
 
-		ipriceLo, err := strconv.ParseUint(priceLo, 10, 64)
+		ipriceLo, err := strconv.ParseUint(priceLo, 10, intBits)
 		if err != nil && priceLo != "" {
 			log.Println("error parsing priceLo:", err)
 			cancel()
 			return
 		}
 
-		ipriceHi, err := strconv.ParseUint(priceHi, 10, 64)
+		ipriceHi, err := strconv.ParseUint(priceHi, 10, intBits)
 		if err != nil && priceHi != "" {
 			log.Println("error parsing priceHi:", err)
 			cancel()
@@ -98,13 +95,13 @@ func Scrape(pageTemplates []string, dbName string) {
 			id:        id,
 			name:      name,
 			condition: condition,
-			priceLo:   ipriceLo,
-			priceHi:   ipriceHi,
+			priceLo:   uint(ipriceLo),
+			priceHi:   uint(ipriceHi),
 		}
 	})
 
 	c.OnRequest(func(r *colly.Request) {
-		//log.Println("Visiting", r.URL)
+		log.Println("Visiting", r.URL)
 	})
 
 	os.Remove(dbName)
@@ -169,7 +166,16 @@ func Scrape(pageTemplates []string, dbName string) {
 
 	log.Println("Visiting begin")
 	for _, t := range pageTemplates {
-		c.Visit(fmt.Sprintf("%s1", t))
+		reqCtx := colly.NewContext()
+		reqCtx.Put("template", t)
+
+		c.Request(
+			"GET",
+			fmt.Sprintf("%s1", t),
+			nil,
+			reqCtx,
+			nil,
+		)
 	}
 
 	c.Wait()
