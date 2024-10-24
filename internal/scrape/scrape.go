@@ -1,4 +1,4 @@
-package main
+package scrape
 
 import (
 	"context"
@@ -17,21 +17,21 @@ import (
 )
 
 type product struct {
-	id        uint64
+	id        string
 	name      string
 	condition string
 	priceLo   uint64
 	priceHi   uint64
 }
 
-func main() {
+func Scrape(pageTemplates []string, dbName string) {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
 
 	products := make(chan product)
 
 	c := colly.NewCollector(
 		colly.Async(true),
-		colly.CacheDir("cache"),
+		//colly.CacheDir("cache"),
 		colly.StdlibContext(ctx),
 	)
 
@@ -44,10 +44,6 @@ func main() {
 	// Both of these URLs report 1822 entries, yet for some reason
 	// they yield overlapping but distinct sets, and their union is still
 	// only 1760 entries.
-	pageTemplates := []string{
-		"https://www.suruga-ya.com/ja/category/5010900?page=",
-		"https://www.suruga-ya.com/ja/products?category=5010900&page=",
-	}
 
 	c.OnHTML("a.page-link[href]", func(e *colly.HTMLElement) {
 		// Predictively synthesize remaining links (major optimization)
@@ -84,13 +80,6 @@ func main() {
 			}
 		}
 
-		iid, err := strconv.ParseUint(id, 10, 64)
-		if err != nil {
-			log.Println("error parsing id:", err)
-			cancel()
-			return
-		}
-
 		ipriceLo, err := strconv.ParseUint(priceLo, 10, 64)
 		if err != nil && priceLo != "" {
 			log.Println("error parsing priceLo:", err)
@@ -106,7 +95,7 @@ func main() {
 		}
 
 		products <- product{
-			id:        iid,
+			id:        id,
 			name:      name,
 			condition: condition,
 			priceLo:   ipriceLo,
@@ -118,7 +107,8 @@ func main() {
 		//log.Println("Visiting", r.URL)
 	})
 
-	db, err := sql.Open("sqlite3", "file:products.db")
+	os.Remove(dbName)
+	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s", dbName))
 	if err != nil {
 		log.Println("error opening database:", err)
 		return
@@ -140,7 +130,7 @@ func main() {
 			return
 		}
 
-		_, err = tx.ExecContext(ctx, "CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT NOT NULL, condition TEXT NOT NULL, priceLo INTEGER NOT NULL, priceHi INTEGER NOT NULL) STRICT")
+		_, err = tx.ExecContext(ctx, "CREATE TABLE products(id TEXT PRIMARY KEY, name TEXT NOT NULL, condition TEXT NOT NULL, priceLo INTEGER NOT NULL, priceHi INTEGER NOT NULL) WITHOUT ROWID, STRICT")
 		if err != nil {
 			log.Println("error creating table:", err)
 			return
@@ -152,7 +142,7 @@ func main() {
 			return
 		}
 
-		uniq := make(map[uint64]struct{})
+		uniq := make(map[string]struct{})
 		for prod := range products {
 			key := prod.id
 			if _, ok := uniq[key]; !ok {
