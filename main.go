@@ -1,9 +1,13 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -21,12 +25,34 @@ type product struct {
 }
 
 func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+
 	products := make(chan product)
 
-	c := colly.NewCollector(colly.Async(true), colly.CacheDir("cache"))
+	c := colly.NewCollector(
+		colly.Async(true),
+		colly.CacheDir("cache"),
+		colly.StdlibContext(ctx),
+	)
+
+	pageRe := regexp.MustCompile("page=([0-9]+)")
+
+	// Both of these URLs report 1822 entries, yet for some reason
+	// they yield overlapping but distinct sets, and their union is still
+	// only 1760 entries.
+	pageTemplates := []string{
+		"https://www.suruga-ya.com/ja/category/5010900?page=",
+		"https://www.suruga-ya.com/ja/products?category=5010900&page=",
+	}
 
 	c.OnHTML("a.page-link[href]", func(e *colly.HTMLElement) {
-		e.Request.Visit(e.Attr("href"))
+		url := e.Attr("href")
+		page, _ := strconv.ParseUint(pageRe.FindStringSubmatch(url)[1], 10, 64)
+		for p := uint64(1); p <= page; p++ {
+			for _, t := range pageTemplates {
+				e.Request.Visit(fmt.Sprintf("%s%d", t, p))
+			}
+		}
 	})
 
 	c.OnHTML(".product_wrap", func(e *colly.HTMLElement) {
@@ -53,17 +79,23 @@ func main() {
 
 		iid, err := strconv.ParseUint(id, 10, 64)
 		if err != nil {
-			log.Fatalln("error parsing id:", err)
+			log.Println("error parsing id:", err)
+			cancel()
+			return
 		}
 
 		ipriceLo, err := strconv.ParseUint(priceLo, 10, 64)
 		if err != nil && priceLo != "" {
-			log.Fatalln("error parsing priceLo:", err)
+			log.Println("error parsing priceLo:", err)
+			cancel()
+			return
 		}
 
 		ipriceHi, err := strconv.ParseUint(priceHi, 10, 64)
 		if err != nil && priceHi != "" {
-			log.Fatalln("error parsing priceHi:", err)
+			log.Println("error parsing priceHi:", err)
+			cancel()
+			return
 		}
 
 		products <- product{
@@ -76,25 +108,29 @@ func main() {
 	})
 
 	c.OnRequest(func(r *colly.Request) {
-		fmt.Println("Visiting", r.URL)
+		log.Println("Visiting", r.URL)
 	})
 
-	writingDone := make(chan struct{})
+	db, err := sql.Open("sqlite3", "file:products.db")
+	if err != nil {
+		log.Println("error opening database:", err)
+		return
+	}
+	defer db.Close()
 
 	go func() {
-		db, err := sql.Open("sqlite3", "file:products.db")
+		defer cancel()
+
+		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
-			log.Fatalln("error opening database:", err)
+			log.Println("error beginning tx:", err)
+			return
 		}
 
 		_, err = db.Exec("CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT NOT NULL, condition TEXT NOT NULL, priceLo INTEGER NOT NULL, priceHi INTEGER NOT NULL) STRICT")
 		if err != nil {
-			log.Fatalln("error creating table:", err)
-		}
-
-		tx, err := db.Begin()
-		if err != nil {
-			log.Fatalln("error beginning tx:", err)
+			log.Println("error creating table:", err)
+			return
 		}
 
 		uniq := make(map[uint64]struct{})
@@ -105,30 +141,31 @@ func main() {
 
 				_, err = tx.Exec("INSERT INTO products VALUES (?, ?, ?, ?, ?)", prod.id, prod.name, prod.condition, prod.priceLo, prod.priceHi)
 				if err != nil {
-					log.Fatalln("error inserting product:", err)
+					log.Println("error inserting product:", err)
+					return
 				}
 			}
 		}
 
 		err = tx.Commit()
 		if err != nil {
-			log.Fatalln("error committing tx:", err)
+			log.Println("error committing tx:", err)
+			return
 		}
 
 		err = db.Close()
 		if err != nil {
-			log.Fatalln("error closing database:", err)
+			log.Println("error closing database:", err)
+			return
 		}
-		close(writingDone)
 	}()
 
-	// Both of these URLs report 1822 entries, yet for some reason
-	// they yield overlapping but distinct sets, and their union is still
-	// only 1760 entries.
-	c.Visit("https://www.suruga-ya.com/ja/category/5010900?page=1")
-	c.Visit("https://www.suruga-ya.com/ja/products?category=5010900&page=1")
+	for _, t := range pageTemplates {
+		c.Visit(fmt.Sprintf("%s1", t))
+	}
 
 	c.Wait()
 	close(products)
-	<-writingDone
+
+	<-ctx.Done()
 }
