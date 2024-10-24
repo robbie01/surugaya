@@ -35,7 +35,11 @@ func main() {
 		colly.StdlibContext(ctx),
 	)
 
-	pageRe := regexp.MustCompile("page=([0-9]+)")
+	pageRe, err := regexp.Compile("page=([0-9]+)")
+	if err != nil {
+		log.Println("error compiling regex:", err)
+		return
+	}
 
 	// Both of these URLs report 1822 entries, yet for some reason
 	// they yield overlapping but distinct sets, and their union is still
@@ -46,6 +50,9 @@ func main() {
 	}
 
 	c.OnHTML("a.page-link[href]", func(e *colly.HTMLElement) {
+		// Predictively synthesize remaining links (major optimization)
+		// Deduplication is not a concern here; colly handles this for us
+
 		url := e.Attr("href")
 		page, _ := strconv.ParseUint(pageRe.FindStringSubmatch(url)[1], 10, 64)
 		for p := uint64(1); p <= page; p++ {
@@ -108,7 +115,7 @@ func main() {
 	})
 
 	c.OnRequest(func(r *colly.Request) {
-		log.Println("Visiting", r.URL)
+		//log.Println("Visiting", r.URL)
 	})
 
 	db, err := sql.Open("sqlite3", "file:products.db")
@@ -117,6 +124,12 @@ func main() {
 		return
 	}
 	defer db.Close()
+
+	context.AfterFunc(ctx, func() {
+		// Drain products on cancel
+		for range products {
+		}
+	})
 
 	go func() {
 		defer cancel()
@@ -127,9 +140,15 @@ func main() {
 			return
 		}
 
-		_, err = db.Exec("CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT NOT NULL, condition TEXT NOT NULL, priceLo INTEGER NOT NULL, priceHi INTEGER NOT NULL) STRICT")
+		_, err = tx.ExecContext(ctx, "CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT NOT NULL, condition TEXT NOT NULL, priceLo INTEGER NOT NULL, priceHi INTEGER NOT NULL) STRICT")
 		if err != nil {
 			log.Println("error creating table:", err)
+			return
+		}
+
+		stmt, err := tx.PrepareContext(ctx, "INSERT INTO products VALUES (?, ?, ?, ?, ?)")
+		if err != nil {
+			log.Println("error preparing statement:", err)
 			return
 		}
 
@@ -139,7 +158,7 @@ func main() {
 			if _, ok := uniq[key]; !ok {
 				uniq[key] = struct{}{}
 
-				_, err = tx.Exec("INSERT INTO products VALUES (?, ?, ?, ?, ?)", prod.id, prod.name, prod.condition, prod.priceLo, prod.priceHi)
+				_, err = stmt.ExecContext(ctx, prod.id, prod.name, prod.condition, prod.priceLo, prod.priceHi)
 				if err != nil {
 					log.Println("error inserting product:", err)
 					return
@@ -147,25 +166,30 @@ func main() {
 			}
 		}
 
-		err = tx.Commit()
-		if err != nil {
-			log.Println("error committing tx:", err)
-			return
-		}
+		if ctx.Err() == nil {
+			err = tx.Commit()
+			if err != nil {
+				log.Println("error committing tx:", err)
+				return
+			}
 
-		err = db.Close()
-		if err != nil {
-			log.Println("error closing database:", err)
-			return
+			log.Println("successfully wrote products database")
 		}
 	}()
 
+	log.Println("Visiting begin")
 	for _, t := range pageTemplates {
 		c.Visit(fmt.Sprintf("%s1", t))
 	}
 
 	c.Wait()
 	close(products)
+	log.Println("Visiting finished")
 
 	<-ctx.Done()
+
+	err = db.Close()
+	if err != nil {
+		log.Println("error closing database:", err)
+	}
 }
