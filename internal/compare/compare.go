@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net/url"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -21,28 +22,36 @@ type Change struct {
 }
 
 func Compare(oldDb string, newDb string) (changes []Change) {
-	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s?mode=ro", newDb))
+	fmt.Println((&url.URL{
+		Scheme:   "file",
+		Path:     newDb,
+		RawQuery: "mode=ro",
+	}).String())
+
+	db, err := sql.Open("sqlite3", "file:"+(&url.URL{
+		Path:     newDb,
+		RawQuery: "mode=ro",
+	}).String())
 	if err != nil {
 		log.Println("error opening new database:", err)
 		return
 	}
 	defer db.Close()
 
-	_, err = db.Exec("ATTACH DATABASE ? AS old", fmt.Sprintf("file:%s?mode=ro", oldDb))
+	_, err = db.Exec("ATTACH DATABASE ? AS old", "file:"+(&url.URL{
+		Path:     oldDb,
+		RawQuery: "mode=ro",
+	}).String())
 	if err != nil {
 		log.Println("error opening old database:", err)
 		return
 	}
 
 	rs, err := db.Query(`SELECT id,
-	    COALESCE(o.name, ''),
-		COALESCE(n.name, ''),
-		COALESCE(o.condition, ''),
-		COALESCE(n.condition, ''),
-		COALESCE(o.priceLo, 0),
-		COALESCE(n.priceLo, 0),
-		COALESCE(o.priceHi, 0),
-		COALESCE(n.priceHi, 0)
+	    COALESCE(o.name, ''), COALESCE(n.name, ''),
+		COALESCE(o.condition, ''), COALESCE(n.condition, ''),
+		COALESCE(o.priceLo, 0), COALESCE(n.priceLo, 0),
+		COALESCE(o.priceHi, 0), COALESCE(n.priceHi, 0)
 		FROM main.products AS n FULL OUTER JOIN old.products AS o USING (id)
 		WHERE o.id IS NULL or n.id IS NULL
 		OR o.name <> n.name

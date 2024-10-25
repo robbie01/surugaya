@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"net/url"
 	"os"
 	"os/signal"
 	"regexp"
@@ -28,7 +29,14 @@ type product struct {
 const intBits int = int(unsafe.Sizeof(1) * 8)
 
 func Scrape(pageTemplates []string, dbName string) {
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt)
+	ctx, cancel := context.WithCancelCause(context.Background())
+
+	sig := make(chan os.Signal, 1)
+	signal.Notify(sig, os.Interrupt)
+	go func() {
+		<-sig
+		cancel(fmt.Errorf("interrupted"))
+	}()
 
 	products := make(chan product)
 
@@ -49,7 +57,11 @@ func Scrape(pageTemplates []string, dbName string) {
 		// Deduplication is not a concern here; colly handles this for us
 
 		url := e.Attr("href")
-		page, _ := strconv.ParseUint(pageRe.FindStringSubmatch(url)[1], 10, intBits)
+		page, err := strconv.ParseUint(pageRe.FindStringSubmatch(url)[1], 10, intBits)
+		if err != nil {
+			cancel(fmt.Errorf("failed to parse page link at %s: %w", url, err))
+		}
+
 		for p := uint(1); p <= uint(page); p++ {
 			e.Request.Visit(fmt.Sprintf("%s%d", e.Request.Ctx.Get("template"), p))
 		}
@@ -77,17 +89,20 @@ func Scrape(pageTemplates []string, dbName string) {
 			}
 		}
 
+		if id == "" {
+			cancel(fmt.Errorf("id is empty at %s", e.Request.URL.String()))
+			return
+		}
+
 		ipriceLo, err := strconv.ParseUint(priceLo, 10, intBits)
 		if err != nil && priceLo != "" {
-			log.Println("error parsing priceLo:", err)
-			cancel()
+			cancel(fmt.Errorf("error parsing priceLo at %s: %w", e.Request.URL.String(), err))
 			return
 		}
 
 		ipriceHi, err := strconv.ParseUint(priceHi, 10, intBits)
 		if err != nil && priceHi != "" {
-			log.Println("error parsing priceHi:", err)
-			cancel()
+			cancel(fmt.Errorf("error parsing priceHi at %s: %w", e.Request.URL.String(), err))
 			return
 		}
 
@@ -105,37 +120,43 @@ func Scrape(pageTemplates []string, dbName string) {
 	})
 
 	os.Remove(dbName)
-	db, err := sql.Open("sqlite3", fmt.Sprintf("file:%s", dbName))
+	db, err := sql.Open("sqlite3", "file:"+(&url.URL{
+		Path:     dbName,
+		RawQuery: "mode=rwc",
+	}).String())
 	if err != nil {
 		log.Println("error opening database:", err)
 		return
 	}
-	defer db.Close()
 
 	context.AfterFunc(ctx, func() {
-		// Drain products on cancel
+		// Drain products on cancel to unblock colly
 		for range products {
 		}
 	})
 
 	go func() {
-		defer cancel()
-
 		tx, err := db.BeginTx(ctx, nil)
 		if err != nil {
-			log.Println("error beginning tx:", err)
+			cancel(fmt.Errorf("error beginning tx: %w", err))
 			return
 		}
 
-		_, err = tx.ExecContext(ctx, "CREATE TABLE products(id TEXT PRIMARY KEY, name TEXT NOT NULL, condition TEXT NOT NULL, priceLo INTEGER NOT NULL, priceHi INTEGER NOT NULL) WITHOUT ROWID, STRICT")
+		_, err = tx.ExecContext(ctx, `CREATE TABLE products(
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			condition TEXT NOT NULL,
+			priceLo INTEGER NOT NULL,
+			priceHi INTEGER NOT NULL
+		) WITHOUT ROWID, STRICT`)
 		if err != nil {
-			log.Println("error creating table:", err)
+			cancel(fmt.Errorf("error creating table: %w", err))
 			return
 		}
 
 		stmt, err := tx.PrepareContext(ctx, "INSERT INTO products VALUES (?, ?, ?, ?, ?)")
 		if err != nil {
-			log.Println("error preparing statement:", err)
+			cancel(fmt.Errorf("error preparing statement: %w", err))
 			return
 		}
 
@@ -147,7 +168,7 @@ func Scrape(pageTemplates []string, dbName string) {
 
 				_, err = stmt.ExecContext(ctx, prod.id, prod.name, prod.condition, prod.priceLo, prod.priceHi)
 				if err != nil {
-					log.Println("error inserting product:", err)
+					cancel(fmt.Errorf("error inserting product: %w", err))
 					return
 				}
 			}
@@ -156,11 +177,11 @@ func Scrape(pageTemplates []string, dbName string) {
 		if ctx.Err() == nil {
 			err = tx.Commit()
 			if err != nil {
-				log.Println("error committing tx:", err)
+				cancel(fmt.Errorf("error committing tx: %w", err))
 				return
 			}
 
-			log.Println("successfully wrote products database")
+			cancel(nil) // The only clean exit point
 		}
 	}()
 
@@ -180,12 +201,19 @@ func Scrape(pageTemplates []string, dbName string) {
 
 	c.Wait()
 	close(products)
-	log.Println("Visiting finished")
 
 	<-ctx.Done()
 
-	err = db.Close()
-	if err != nil {
-		log.Println("error closing database:", err)
+	err = context.Cause(ctx)
+	if err == context.Canceled {
+		err = db.Close()
+		if err != nil {
+			log.Println("error closing database:", err)
+			return
+		}
+
+		log.Println("successfully wrote products database")
+	} else {
+		log.Println(err)
 	}
 }
